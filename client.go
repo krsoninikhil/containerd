@@ -116,6 +116,21 @@ func New(address string, opts ...ClientOpt) (*Client, error) {
 				grpc.WithUnaryInterceptor(unary),
 				grpc.WithStreamInterceptor(stream),
 			)
+
+			namespaces = c.NamespaceService()
+			labels, err := namespaces.Labels(ctx, copts.defaultns)
+			if err != nil {
+				return nil, err
+			}
+			for k, v := range labels {
+				if validField, _ := reflections.HasField(c, k); !validField {
+					continue
+				}
+				err := reflection.SetField(c, k, v)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 		connector := func() (*grpc.ClientConn, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), copts.timeout)
