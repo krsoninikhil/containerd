@@ -206,7 +206,7 @@ func (s *snapshotter) Remove(ctx context.Context, key string) error {
 
 	path := s.getSnapshotDir(id)
 	renamedID := "rm-" + id
-	renamed := filepath.Join(s.root, "snapshots", "rm-"+id)
+	renamed := filepath.Join(s.root, "snapshots", renamedID)
 	if err := os.Rename(path, renamed); err != nil && !os.IsNotExist(err) {
 		return err
 	}
