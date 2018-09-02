@@ -93,19 +93,6 @@ func New(address string, opts ...ClientOpt) (*Client, error) {
 		runtime: rt,
 	}
 
-	// check namespace labels for default runtime
-	defaultns := "default"
-	if copts.defaultns != "" {
-		defaultns = copts.defaultns
-	}
-	namespaces := c.NamespaceService()
-	ctx := context.Background()
-	if labels, err := namespaces.Labels(ctx, defaultns); err != nil {
-		if defaultRuntime, ok := labels["runtime"]; ok {
-			c.runtime = defaultRuntime
-		}
-	}
-
 	if copts.services != nil {
 		c.services = *copts.services
 	}
