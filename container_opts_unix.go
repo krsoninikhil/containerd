@@ -67,7 +67,7 @@ func WithCheckpoint(im Image, snapshotKey string) NewContainerOpts {
 				if err != nil {
 					return errors.Wrap(err, "unable to get rootfs")
 				}
-				setSnapshotterIfEmpty(c)
+				setSnapshotterIfEmpty(ctx, client, c)
 				if _, err := client.SnapshotService(c.Snapshotter).Prepare(ctx, snapshotKey, identity.ChainID(diffIDs).String()); err != nil {
 					if !errdefs.IsAlreadyExists(err) {
 						return err
@@ -119,7 +119,7 @@ func withRemappedSnapshotBase(id string, i Image, uid, gid uint32, readonly bool
 			return err
 		}
 
-		setSnapshotterIfEmpty(c)
+		setSnapshotterIfEmpty(ctx, client, c)
 
 		var (
 			snapshotter = client.SnapshotService(c.Snapshotter)
