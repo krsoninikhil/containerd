@@ -343,3 +343,28 @@ func TestClientReconnect(t *testing.T) {
 		t.Errorf("client closed returned errror %v", err)
 	}
 }
+
+func TestDefaultRuntimeWithNamespaceLabels(t *testing.T) {
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := testContext()
+	defer cancel()
+	namespaces := client.NamespaceService()
+	testRuntime := "testRuntime"
+	if err := namespaces.SetLabel(ctx, testNamespace, "runtime", testRuntime); err != nil {
+		t.Fatal(err)
+	}
+
+	testClient, err := newClient(t, address, WithDefaultNamespace(testNamespace))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testClient.Close()
+	if testClient.runtime != testRuntime {
+		t.Error("failed to set default runtime from namespace labels")
+	}
+}
