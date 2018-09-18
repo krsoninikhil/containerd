@@ -359,7 +359,7 @@ func TestDefaultRuntimeWithNamespaceLabels(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	testClient, err := newClient(t, address, WithDefaultNamespace(testNamespace))
+	testClient, err := New(address, WithDefaultNamespace(testNamespace))
 	if err != nil {
 		t.Fatal(err)
 	}
