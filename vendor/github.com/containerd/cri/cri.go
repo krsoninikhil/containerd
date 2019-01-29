@@ -36,6 +36,7 @@ import (
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"k8s.io/klog"
 
 	criconfig "github.com/containerd/cri/pkg/config"
 	"github.com/containerd/cri/pkg/constants"
@@ -71,6 +72,10 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 	}
 	log.G(ctx).Infof("Start cri plugin with config %+v", c)
 
+	if err := validateConfig(&c); err != nil {
+		return nil, errors.Wrap(err, "invalid config")
+	}
+
 	if err := setGLogLevel(); err != nil {
 		return nil, errors.Wrap(err, "failed to set glog level")
 	}
@@ -102,6 +107,18 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 		// TODO(random-liu): Whether and how we can stop containerd.
 	}()
 	return s, nil
+}
+
+// validateConfig validates the given configuration.
+func validateConfig(c *criconfig.Config) error {
+	// It is an error to provide both an UntrustedWorkloadRuntime & define an 'untrusted' runtime.
+	if _, ok := c.ContainerdConfig.Runtimes[criconfig.RuntimeUntrusted]; ok {
+		if c.ContainerdConfig.UntrustedWorkloadRuntime.Type != "" {
+			return errors.New("conflicting definitions: configuration includes untrusted_workload_runtime and runtimes['untrusted']")
+		}
+	}
+
+	return nil
 }
 
 // getServicesOpts get service options from plugin context.
@@ -159,16 +176,18 @@ func getServicesOpts(ic *plugin.InitContext) ([]containerd.ServicesOpt, error) {
 // Set glog level.
 func setGLogLevel() error {
 	l := logrus.GetLevel()
-	if err := flag.Set("logtostderr", "true"); err != nil {
+	fs := flag.NewFlagSet("klog", flag.PanicOnError)
+	klog.InitFlags(fs)
+	if err := fs.Set("logtostderr", "true"); err != nil {
 		return err
 	}
 	switch l {
 	case log.TraceLevel:
-		return flag.Set("v", "5")
+		return fs.Set("v", "5")
 	case logrus.DebugLevel:
-		return flag.Set("v", "4")
+		return fs.Set("v", "4")
 	case logrus.InfoLevel:
-		return flag.Set("v", "2")
+		return fs.Set("v", "2")
 	// glog doesn't support following filters. Defaults to v=0.
 	case logrus.WarnLevel:
 	case logrus.ErrorLevel:

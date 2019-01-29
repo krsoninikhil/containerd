@@ -21,12 +21,12 @@ package linux
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/boltdb/bolt"
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/containers"
@@ -41,6 +41,7 @@ import (
 	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/runtime"
 	"github.com/containerd/containerd/runtime/linux/runctypes"
+	"github.com/containerd/containerd/runtime/v1"
 	"github.com/containerd/containerd/runtime/v1/linux/proc"
 	shim "github.com/containerd/containerd/runtime/v1/shim/v1"
 	runc "github.com/containerd/go-runc"
@@ -49,6 +50,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
 )
 
@@ -288,6 +290,10 @@ func (r *Runtime) restoreTasks(ctx context.Context) ([]*Task, error) {
 			continue
 		}
 		name := namespace.Name()
+		// skip hidden directories
+		if len(name) > 0 && name[0] == '.' {
+			continue
+		}
 		log.G(ctx).WithField("namespace", name).Debug("loading tasks in namespace")
 		tasks, err := r.loadTasks(ctx, name)
 		if err != nil {
@@ -301,6 +307,16 @@ func (r *Runtime) restoreTasks(ctx context.Context) ([]*Task, error) {
 // Get a specific task by task id
 func (r *Runtime) Get(ctx context.Context, id string) (runtime.Task, error) {
 	return r.tasks.Get(ctx, id)
+}
+
+// Add a runtime task
+func (r *Runtime) Add(ctx context.Context, task runtime.Task) error {
+	return r.tasks.Add(ctx, task)
+}
+
+// Delete a runtime task
+func (r *Runtime) Delete(ctx context.Context, id string) {
+	r.tasks.Delete(ctx, id)
 }
 
 func (r *Runtime) loadTasks(ctx context.Context, ns string) ([]*Task, error) {
@@ -340,6 +356,30 @@ func (r *Runtime) loadTasks(ctx context.Context, ns string) ([]*Task, error) {
 			}
 			continue
 		}
+
+		logDirPath := filepath.Join(r.root, ns, id)
+
+		shimStdoutLog, err := v1.OpenShimStdoutLog(ctx, logDirPath)
+		if err != nil {
+			log.G(ctx).WithError(err).WithFields(logrus.Fields{
+				"id":         id,
+				"namespace":  ns,
+				"logDirPath": logDirPath,
+			}).Error("opening shim stdout log pipe")
+			continue
+		}
+		go io.Copy(os.Stdout, shimStdoutLog)
+
+		shimStderrLog, err := v1.OpenShimStderrLog(ctx, logDirPath)
+		if err != nil {
+			log.G(ctx).WithError(err).WithFields(logrus.Fields{
+				"id":         id,
+				"namespace":  ns,
+				"logDirPath": logDirPath,
+			}).Error("opening shim stderr log pipe")
+			continue
+		}
+		go io.Copy(os.Stderr, shimStderrLog)
 
 		t, err := newTask(id, ns, pid, s, r.events, r.tasks, bundle)
 		if err != nil {

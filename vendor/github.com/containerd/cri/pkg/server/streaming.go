@@ -34,6 +34,36 @@ import (
 	ctrdutil "github.com/containerd/cri/pkg/containerd/util"
 )
 
+type streamListenerMode int
+
+const (
+	x509KeyPairTLS streamListenerMode = iota
+	selfSignTLS
+	withoutTLS
+)
+
+func getStreamListenerMode(c *criService) (streamListenerMode, error) {
+	if c.config.EnableTLSStreaming {
+		if c.config.X509KeyPairStreaming.TLSCertFile != "" && c.config.X509KeyPairStreaming.TLSKeyFile != "" {
+			return x509KeyPairTLS, nil
+		}
+		if c.config.X509KeyPairStreaming.TLSCertFile != "" && c.config.X509KeyPairStreaming.TLSKeyFile == "" {
+			return -1, errors.New("must set X509KeyPairStreaming.TLSKeyFile")
+		}
+		if c.config.X509KeyPairStreaming.TLSCertFile == "" && c.config.X509KeyPairStreaming.TLSKeyFile != "" {
+			return -1, errors.New("must set X509KeyPairStreaming.TLSCertFile")
+		}
+		return selfSignTLS, nil
+	}
+	if c.config.X509KeyPairStreaming.TLSCertFile != "" {
+		return -1, errors.New("X509KeyPairStreaming.TLSCertFile is set but EnableTLSStreaming is not set")
+	}
+	if c.config.X509KeyPairStreaming.TLSKeyFile != "" {
+		return -1, errors.New("X509KeyPairStreaming.TLSKeyFile is set but EnableTLSStreaming is not set")
+	}
+	return withoutTLS, nil
+}
+
 func newStreamServer(c *criService, addr, port string) (streaming.Server, error) {
 	if addr == "" {
 		a, err := k8snet.ChooseBindAddress(nil)
@@ -44,8 +74,22 @@ func newStreamServer(c *criService, addr, port string) (streaming.Server, error)
 	}
 	config := streaming.DefaultConfig
 	config.Addr = net.JoinHostPort(addr, port)
-	runtime := newStreamRuntime(c)
-	if c.config.EnableTLSStreaming {
+	run := newStreamRuntime(c)
+	tlsMode, err := getStreamListenerMode(c)
+	if err != nil {
+		return nil, errors.Wrapf(err, "invalid stream server configuration")
+	}
+	switch tlsMode {
+	case x509KeyPairTLS:
+		tlsCert, err := tls.LoadX509KeyPair(c.config.X509KeyPairStreaming.TLSCertFile, c.config.X509KeyPairStreaming.TLSKeyFile)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to load x509 key pair for stream server")
+		}
+		config.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{tlsCert},
+		}
+		return streaming.NewServer(config, run)
+	case selfSignTLS:
 		tlsCert, err := newTLSCert()
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to generate tls certificate for stream server")
@@ -54,8 +98,12 @@ func newStreamServer(c *criService, addr, port string) (streaming.Server, error)
 			Certificates:       []tls.Certificate{tlsCert},
 			InsecureSkipVerify: true,
 		}
+		return streaming.NewServer(config, run)
+	case withoutTLS:
+		return streaming.NewServer(config, run)
+	default:
+		return nil, errors.New("invalid configuration for the stream listener")
 	}
-	return streaming.NewServer(config, runtime)
 }
 
 type streamRuntime struct {
@@ -128,7 +176,7 @@ func handleResizing(resize <-chan remotecommand.TerminalSize, resizeFunc func(si
 
 // newTLSCert returns a self CA signed tls.certificate.
 // TODO (mikebrow): replace / rewrite this function to support using CA
-// signing of the cetificate. Requires a security plan for kubernetes regarding
+// signing of the certificate. Requires a security plan for kubernetes regarding
 // CRI connections / streaming, etc. For example, kubernetes could configure or
 // require a CA service and pass a configuration down through CRI.
 func newTLSCert() (tls.Certificate, error) {

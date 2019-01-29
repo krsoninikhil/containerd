@@ -19,7 +19,6 @@ package server
 import (
 	"time"
 
-	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/docker/docker/pkg/signal"
 	"github.com/pkg/errors"
@@ -28,12 +27,16 @@ import (
 	"golang.org/x/sys/unix"
 	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 
+	"github.com/containerd/cri/pkg/store"
 	containerstore "github.com/containerd/cri/pkg/store/container"
 )
 
 // killContainerTimeout is the timeout that we wait for the container to
 // be SIGKILLed.
-const killContainerTimeout = 2 * time.Minute
+// The timeout is set to 1 min, because the default CRI operation timeout
+// for StopContainer is (2 min + stop timeout). Set to 1 min, so that we
+// have enough time for kill(all=true) and kill(all=false).
+const killContainerTimeout = 1 * time.Minute
 
 // StopContainer stops a running container with a grace period (i.e., timeout).
 func (c *criService) StopContainer(ctx context.Context, r *runtime.StopContainerRequest) (*runtime.StopContainerResponse, error) {
@@ -63,47 +66,6 @@ func (c *criService) stopContainer(ctx context.Context, container containerstore
 		return nil
 	}
 
-	if timeout > 0 {
-		stopSignal := unix.SIGTERM
-		image, err := c.imageStore.Get(container.ImageRef)
-		if err != nil {
-			// NOTE(random-liu): It's possible that the container is stopped,
-			// deleted and image is garbage collected before this point. However,
-			// the chance is really slim, even it happens, it's still fine to return
-			// an error here.
-			return errors.Wrapf(err, "failed to get image metadata %q", container.ImageRef)
-		}
-		if image.ImageSpec.Config.StopSignal != "" {
-			stopSignal, err = signal.ParseSignal(image.ImageSpec.Config.StopSignal)
-			if err != nil {
-				return errors.Wrapf(err, "failed to parse stop signal %q",
-					image.ImageSpec.Config.StopSignal)
-			}
-		}
-		logrus.Infof("Stop container %q with signal %v", id, stopSignal)
-		task, err := container.Container.Task(ctx, nil)
-		if err != nil {
-			if !errdefs.IsNotFound(err) {
-				return errors.Wrapf(err, "failed to stop container, task not found for container %q", id)
-			}
-			return nil
-		}
-		if task != nil {
-			if err = task.Kill(ctx, stopSignal); err != nil {
-				if !errdefs.IsNotFound(err) {
-					return errors.Wrapf(err, "failed to stop container %q", id)
-				}
-				// Move on to make sure container status is updated.
-			}
-		}
-
-		err = c.waitContainerStop(ctx, container, timeout)
-		if err == nil {
-			return nil
-		}
-		logrus.WithError(err).Errorf("Stop container %q timed out", id)
-	}
-
 	task, err := container.Container.Task(ctx, nil)
 	if err != nil {
 		if !errdefs.IsNotFound(err) {
@@ -111,22 +73,59 @@ func (c *criService) stopContainer(ctx context.Context, container containerstore
 		}
 		return nil
 	}
-	// Event handler will Delete the container from containerd after it handles the Exited event.
-	logrus.Infof("Kill container %q", id)
-	if task != nil {
-		if err = task.Kill(ctx, unix.SIGKILL, containerd.WithKillAll); err != nil {
-			if !errdefs.IsNotFound(err) {
-				return errors.Wrapf(err, "failed to kill container %q", id)
+
+	// We only need to kill the task. The event handler will Delete the
+	// task from containerd after it handles the Exited event.
+	if timeout > 0 {
+		stopSignal := "SIGTERM"
+		if container.StopSignal != "" {
+			stopSignal = container.StopSignal
+		} else {
+			// The image may have been deleted, and the `StopSignal` field is
+			// just introduced to handle that.
+			// However, for containers created before the `StopSignal` field is
+			// introduced, still try to get the stop signal from the image config.
+			// If the image has been deleted, logging an error and using the
+			// default SIGTERM is still better than returning error and leaving
+			// the container unstoppable. (See issue #990)
+			// TODO(random-liu): Remove this logic when containerd 1.2 is deprecated.
+			image, err := c.imageStore.Get(container.ImageRef)
+			if err != nil {
+				if err != store.ErrNotExist {
+					return errors.Wrapf(err, "failed to get image %q", container.ImageRef)
+				}
+				logrus.Warningf("Image %q not found, stop container with signal %q", container.ImageRef, stopSignal)
+			} else {
+				if image.ImageSpec.Config.StopSignal != "" {
+					stopSignal = image.ImageSpec.Config.StopSignal
+				}
 			}
-			// Move on to make sure container status is updated.
 		}
+		sig, err := signal.ParseSignal(stopSignal)
+		if err != nil {
+			return errors.Wrapf(err, "failed to parse stop signal %q", stopSignal)
+		}
+		logrus.Infof("Stop container %q with signal %v", id, sig)
+		if err = task.Kill(ctx, sig); err != nil && !errdefs.IsNotFound(err) {
+			return errors.Wrapf(err, "failed to stop container %q", id)
+		}
+
+		if err = c.waitContainerStop(ctx, container, timeout); err == nil {
+			return nil
+		}
+		logrus.WithError(err).Errorf("An error occurs during waiting for container %q to be stopped", id)
+	}
+
+	logrus.Infof("Kill container %q", id)
+	if err = task.Kill(ctx, unix.SIGKILL); err != nil && !errdefs.IsNotFound(err) {
+		return errors.Wrapf(err, "failed to kill container %q", id)
 	}
 
 	// Wait for a fixed timeout until container stop is observed by event monitor.
-	if err := c.waitContainerStop(ctx, container, killContainerTimeout); err != nil {
-		return errors.Wrapf(err, "an error occurs during waiting for container %q to stop", id)
+	if err = c.waitContainerStop(ctx, container, killContainerTimeout); err == nil {
+		return nil
 	}
-	return nil
+	return errors.Wrapf(err, "an error occurs during waiting for container %q to be killed", id)
 }
 
 // waitContainerStop waits for container to be stopped until timeout exceeds or context is cancelled.

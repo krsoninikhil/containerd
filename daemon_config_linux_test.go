@@ -30,7 +30,7 @@ import (
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/pkg/testutil"
 	"github.com/containerd/containerd/runtime/v2/runc/options"
-	"github.com/containerd/containerd/services/server"
+	srvconfig "github.com/containerd/containerd/services/server/config"
 )
 
 // the following nolint is for shutting up gometalinter on non-linux.
@@ -42,7 +42,7 @@ func newDaemonWithConfig(t *testing.T, configTOML string) (*Client, *daemon, fun
 	testutil.RequiresRoot(t)
 	var (
 		ctrd              = daemon{}
-		configTOMLDecoded server.Config
+		configTOMLDecoded srvconfig.Config
 		buf               = bytes.NewBuffer(nil)
 	)
 
@@ -61,7 +61,7 @@ func newDaemonWithConfig(t *testing.T, configTOML string) (*Client, *daemon, fun
 		t.Fatal(err)
 	}
 
-	if err = server.LoadConfig(configTOMLFile, &configTOMLDecoded); err != nil {
+	if err = srvconfig.LoadConfig(configTOMLFile, &configTOMLDecoded); err != nil {
 		t.Fatal(err)
 	}
 
@@ -140,7 +140,7 @@ func TestDaemonRuntimeRoot(t *testing.T) {
 	}
 
 	id := t.Name()
-	container, err := client.NewContainer(ctx, id, WithNewSpec(oci.WithImageConfig(image), withProcessArgs("top")), WithNewSnapshot(id, image), WithRuntime("io.containerd.runc.v1", &options.Options{
+	container, err := client.NewContainer(ctx, id, WithNewSnapshot(id, image), WithNewSpec(oci.WithImageConfig(image), withProcessArgs("top")), WithRuntime("io.containerd.runc.v1", &options.Options{
 		Root: runtimeRoot,
 	}))
 	if err != nil {
@@ -156,10 +156,6 @@ func TestDaemonRuntimeRoot(t *testing.T) {
 
 	status, err := task.Wait(ctx)
 	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err = task.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
 

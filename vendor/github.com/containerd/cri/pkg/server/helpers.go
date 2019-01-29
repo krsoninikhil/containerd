@@ -17,22 +17,22 @@ limitations under the License.
 package server
 
 import (
-	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/containerd/containerd"
+	"github.com/BurntSushi/toml"
 	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/runtime/linux/runctypes"
+	runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/typeurl"
 	"github.com/docker/distribution/reference"
 	imagedigest "github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/identity"
-	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/opencontainers/selinux/go-selinux"
@@ -41,6 +41,7 @@ import (
 	"golang.org/x/net/context"
 	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 
+	runtimeoptions "github.com/containerd/cri/pkg/api/runtimeoptions/v1"
 	criconfig "github.com/containerd/cri/pkg/config"
 	"github.com/containerd/cri/pkg/store"
 	imagestore "github.com/containerd/cri/pkg/store/image"
@@ -95,6 +96,8 @@ const (
 	etcHosts = "/etc/hosts"
 	// resolvConfPath is the abs path of resolv.conf on host or container.
 	resolvConfPath = "/etc/resolv.conf"
+	// hostnameEnv is the key for HOSTNAME env.
+	hostnameEnv = "HOSTNAME"
 )
 
 const (
@@ -106,6 +109,10 @@ const (
 	containerKindSandbox = "sandbox"
 	// containerKindContainer is a label value indicating container is application container
 	containerKindContainer = "container"
+	// imageLabelKey is the label key indicating the image is managed by cri plugin.
+	imageLabelKey = criContainerdPrefix + ".image"
+	// imageLabelValue is the label value indicating the image is managed by cri plugin.
+	imageLabelValue = "managed"
 	// sandboxMetadataExtension is an extension name that identify metadata of sandbox in CreateContainerRequest
 	sandboxMetadataExtension = criContainerdPrefix + ".sandbox.metadata"
 	// containerMetadataExtension is an extension name that identify metadata of container in CreateContainerRequest
@@ -120,13 +127,21 @@ const (
 	networkAttachCount = 2
 )
 
+// Runtime type strings for various runtimes.
+const (
+	// linuxRuntime is the legacy linux runtime for shim v1.
+	linuxRuntime = "io.containerd.runtime.v1.linux"
+	// runcRuntime is the runc runtime for shim v2.
+	runcRuntime = "io.containerd.runc.v1"
+)
+
 // makeSandboxName generates sandbox name from sandbox metadata. The name
 // generated is unique as long as sandbox metadata is unique.
 func makeSandboxName(s *runtime.PodSandboxMetadata) string {
 	return strings.Join([]string{
-		s.Name,      // 0
-		s.Namespace, // 1
-		s.Uid,       // 2
+		s.Name,                       // 0
+		s.Namespace,                  // 1
+		s.Uid,                        // 2
 		fmt.Sprintf("%d", s.Attempt), // 3
 	}, nameDelimiter)
 }
@@ -136,10 +151,10 @@ func makeSandboxName(s *runtime.PodSandboxMetadata) string {
 // unique.
 func makeContainerName(c *runtime.ContainerMetadata, s *runtime.PodSandboxMetadata) string {
 	return strings.Join([]string{
-		c.Name,      // 0
-		s.Name,      // 1: pod name
-		s.Namespace, // 2: pod namespace
-		s.Uid,       // 3: pod uid
+		c.Name,                       // 0
+		s.Name,                       // 1: pod name
+		s.Namespace,                  // 2: pod namespace
+		s.Uid,                        // 3: pod uid
 		fmt.Sprintf("%d", c.Attempt), // 4
 	}, nameDelimiter)
 }
@@ -234,28 +249,25 @@ func getRepoDigestAndTag(namedRef reference.Named, digest imagedigest.Digest, sc
 	return repoDigest, repoTag
 }
 
-// localResolve resolves image reference locally and returns corresponding image metadata. It returns
-// nil without error if the reference doesn't exist.
-func (c *criService) localResolve(ctx context.Context, refOrID string) (*imagestore.Image, error) {
+// localResolve resolves image reference locally and returns corresponding image metadata. It
+// returns store.ErrNotExist if the reference doesn't exist.
+func (c *criService) localResolve(refOrID string) (imagestore.Image, error) {
 	getImageID := func(refOrId string) string {
 		if _, err := imagedigest.Parse(refOrID); err == nil {
 			return refOrID
 		}
 		return func(ref string) string {
 			// ref is not image id, try to resolve it locally.
+			// TODO(random-liu): Handle this error better for debugging.
 			normalized, err := util.NormalizeImageRef(ref)
 			if err != nil {
 				return ""
 			}
-			image, err := c.client.GetImage(ctx, normalized.String())
+			id, err := c.imageStore.Resolve(normalized.String())
 			if err != nil {
 				return ""
 			}
-			desc, err := image.Config(ctx)
-			if err != nil {
-				return ""
-			}
-			return desc.Digest.String()
+			return id
 		}(refOrID)
 	}
 
@@ -264,14 +276,7 @@ func (c *criService) localResolve(ctx context.Context, refOrID string) (*imagest
 		// Try to treat ref as imageID
 		imageID = refOrID
 	}
-	image, err := c.imageStore.Get(imageID)
-	if err != nil {
-		if err == store.ErrNotExist {
-			return nil, nil
-		}
-		return nil, errors.Wrapf(err, "failed to get image %q", imageID)
-	}
-	return &image, nil
+	return c.imageStore.Get(imageID)
 }
 
 // getUserFromImage gets uid or user name of the image user.
@@ -296,12 +301,12 @@ func getUserFromImage(user string) (*int64, string) {
 // ensureImageExists returns corresponding metadata of the image reference, if image is not
 // pulled yet, the function will pull the image.
 func (c *criService) ensureImageExists(ctx context.Context, ref string) (*imagestore.Image, error) {
-	image, err := c.localResolve(ctx, ref)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to resolve image %q", ref)
+	image, err := c.localResolve(ref)
+	if err != nil && err != store.ErrNotExist {
+		return nil, errors.Wrapf(err, "failed to get image %q", ref)
 	}
-	if image != nil {
-		return image, nil
+	if err == nil {
+		return &image, nil
 	}
 	// Pull image to ensure the image exists
 	resp, err := c.PullImage(ctx, &runtime.PullImageRequest{Image: &runtime.ImageSpec{Image: ref}})
@@ -312,54 +317,9 @@ func (c *criService) ensureImageExists(ctx context.Context, ref string) (*images
 	newImage, err := c.imageStore.Get(imageID)
 	if err != nil {
 		// It's still possible that someone removed the image right after it is pulled.
-		return nil, errors.Wrapf(err, "failed to get image %q metadata after pulling", imageID)
+		return nil, errors.Wrapf(err, "failed to get image %q after pulling", imageID)
 	}
 	return &newImage, nil
-}
-
-// imageInfo is the information about the image got from containerd.
-type imageInfo struct {
-	id        string
-	chainID   imagedigest.Digest
-	size      int64
-	imagespec imagespec.Image
-}
-
-// getImageInfo gets image info from containerd.
-func getImageInfo(ctx context.Context, image containerd.Image) (*imageInfo, error) {
-	// Get image information.
-	diffIDs, err := image.RootFS(ctx)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get image diffIDs")
-	}
-	chainID := identity.ChainID(diffIDs)
-
-	size, err := image.Size(ctx)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get image compressed resource size")
-	}
-
-	desc, err := image.Config(ctx)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get image config descriptor")
-	}
-	id := desc.Digest.String()
-
-	rb, err := content.ReadBlob(ctx, image.ContentStore(), desc)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to read image config from content store")
-	}
-	var ociimage imagespec.Image
-	if err := json.Unmarshal(rb, &ociimage); err != nil {
-		return nil, errors.Wrapf(err, "failed to unmarshal image config %s", rb)
-	}
-
-	return &imageInfo{
-		id:        id,
-		chainID:   chainID,
-		size:      size,
-		imagespec: ociimage,
-	}, nil
 }
 
 func initSelinuxOpts(selinuxOpt *runtime.SELinuxOption) (string, string, error) {
@@ -370,9 +330,14 @@ func initSelinuxOpts(selinuxOpt *runtime.SELinuxOption) (string, string, error) 
 	// Should ignored selinuxOpts if they are incomplete.
 	if selinuxOpt.GetUser() == "" ||
 		selinuxOpt.GetRole() == "" ||
-		selinuxOpt.GetType() == "" ||
-		selinuxOpt.GetLevel() == "" {
+		selinuxOpt.GetType() == "" {
 		return "", "", nil
+	}
+
+	// make sure the format of "level" is correct.
+	ok, err := checkSelinuxLevel(selinuxOpt.GetLevel())
+	if err != nil || !ok {
+		return "", "", err
 	}
 
 	labelOpts := fmt.Sprintf("%s:%s:%s:%s",
@@ -381,6 +346,18 @@ func initSelinuxOpts(selinuxOpt *runtime.SELinuxOption) (string, string, error) 
 		selinuxOpt.GetType(),
 		selinuxOpt.GetLevel())
 	return label.InitLabels(selinux.DupSecOpt(labelOpts))
+}
+
+func checkSelinuxLevel(level string) (bool, error) {
+	if len(level) == 0 {
+		return true, nil
+	}
+
+	matched, err := regexp.MatchString(`^s\d(-s\d)??(:c\d{1,4}((.c\d{1,4})?,c\d{1,4})*(.c\d{1,4})?(,c\d{1,4}(.c\d{1,4})?)*)?$`, level)
+	if err != nil || !matched {
+		return false, errors.Wrapf(err, "the format of 'level' %q is not correct", level)
+	}
+	return true, nil
 }
 
 // isInCRIMounts checks whether a destination is in CRI mount list.
@@ -425,26 +402,6 @@ func getPodCNILabels(id string, config *runtime.PodSandboxConfig) map[string]str
 	}
 }
 
-// getRuntimeConfigFromContainerInfo gets runtime configuration from containerd
-// container info.
-func getRuntimeConfigFromContainerInfo(c containers.Container) (criconfig.Runtime, error) {
-	r := criconfig.Runtime{
-		Type: c.Runtime.Name,
-	}
-	if c.Runtime.Options == nil {
-		// CRI plugin makes sure that runtime option is always set.
-		return criconfig.Runtime{}, errors.New("runtime options is nil")
-	}
-	data, err := typeurl.UnmarshalAny(c.Runtime.Options)
-	if err != nil {
-		return criconfig.Runtime{}, errors.Wrap(err, "failed to unmarshal runtime options")
-	}
-	runtimeOpts := data.(*runctypes.RuncOptions)
-	r.Engine = runtimeOpts.Runtime
-	r.Root = runtimeOpts.RuntimeRoot
-	return r, nil
-}
-
 // toRuntimeAuthConfig converts cri plugin auth config to runtime auth config.
 func toRuntimeAuthConfig(a criconfig.AuthConfig) *runtime.AuthConfig {
 	return &runtime.AuthConfig{
@@ -453,4 +410,117 @@ func toRuntimeAuthConfig(a criconfig.AuthConfig) *runtime.AuthConfig {
 		Auth:          a.Auth,
 		IdentityToken: a.IdentityToken,
 	}
+}
+
+// mounts defines how to sort runtime.Mount.
+// This is the same with the Docker implementation:
+//   https://github.com/moby/moby/blob/17.05.x/daemon/volumes.go#L26
+type orderedMounts []*runtime.Mount
+
+// Len returns the number of mounts. Used in sorting.
+func (m orderedMounts) Len() int {
+	return len(m)
+}
+
+// Less returns true if the number of parts (a/b/c would be 3 parts) in the
+// mount indexed by parameter 1 is less than that of the mount indexed by
+// parameter 2. Used in sorting.
+func (m orderedMounts) Less(i, j int) bool {
+	return m.parts(i) < m.parts(j)
+}
+
+// Swap swaps two items in an array of mounts. Used in sorting
+func (m orderedMounts) Swap(i, j int) {
+	m[i], m[j] = m[j], m[i]
+}
+
+// parts returns the number of parts in the destination of a mount. Used in sorting.
+func (m orderedMounts) parts(i int) int {
+	return strings.Count(filepath.Clean(m[i].ContainerPath), string(os.PathSeparator))
+}
+
+// parseImageReferences parses a list of arbitrary image references and returns
+// the repotags and repodigests
+func parseImageReferences(refs []string) ([]string, []string) {
+	var tags, digests []string
+	for _, ref := range refs {
+		parsed, err := reference.ParseAnyReference(ref)
+		if err != nil {
+			continue
+		}
+		if _, ok := parsed.(reference.Canonical); ok {
+			digests = append(digests, parsed.String())
+		} else if _, ok := parsed.(reference.Tagged); ok {
+			tags = append(tags, parsed.String())
+		}
+	}
+	return tags, digests
+}
+
+// generateRuntimeOptions generates runtime options from cri plugin config.
+func generateRuntimeOptions(r criconfig.Runtime, c criconfig.Config) (interface{}, error) {
+	if r.Options == nil {
+		if r.Type != linuxRuntime {
+			return nil, nil
+		}
+		// This is a legacy config, generate runctypes.RuncOptions.
+		return &runctypes.RuncOptions{
+			Runtime:       r.Engine,
+			RuntimeRoot:   r.Root,
+			SystemdCgroup: c.SystemdCgroup,
+		}, nil
+	}
+	options := getRuntimeOptionsType(r.Type)
+	if err := toml.PrimitiveDecode(*r.Options, options); err != nil {
+		return nil, err
+	}
+	return options, nil
+}
+
+// getRuntimeOptionsType gets empty runtime options by the runtime type name.
+func getRuntimeOptionsType(t string) interface{} {
+	switch t {
+	case runcRuntime:
+		return &runcoptions.Options{}
+	case linuxRuntime:
+		return &runctypes.RuncOptions{}
+	default:
+		return &runtimeoptions.Options{}
+	}
+}
+
+// getRuntimeOptions get runtime options from container metadata.
+func getRuntimeOptions(c containers.Container) (interface{}, error) {
+	if c.Runtime.Options == nil {
+		return nil, nil
+	}
+	opts, err := typeurl.UnmarshalAny(c.Runtime.Options)
+	if err != nil {
+		return nil, err
+	}
+	return opts, nil
+}
+
+func getCurrentOOMScoreAdj() (int, error) {
+	b, err := ioutil.ReadFile("/proc/self/oom_score_adj")
+	if err != nil {
+		return 0, errors.Wrap(err, "could not get the daemon oom_score_adj")
+	}
+	s := strings.TrimSpace(string(b))
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, errors.Wrap(err, "could not get the daemon oom_score_adj")
+	}
+	return i, nil
+}
+
+func restrictOOMScoreAdj(preferredOOMScoreAdj int) (int, error) {
+	currentOOMScoreAdj, err := getCurrentOOMScoreAdj()
+	if err != nil {
+		return preferredOOMScoreAdj, err
+	}
+	if preferredOOMScoreAdj < currentOOMScoreAdj {
+		return currentOOMScoreAdj, nil
+	}
+	return preferredOOMScoreAdj, nil
 }

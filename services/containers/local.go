@@ -20,7 +20,6 @@ import (
 	"context"
 	"io"
 
-	"github.com/boltdb/bolt"
 	eventstypes "github.com/containerd/containerd/api/events"
 	api "github.com/containerd/containerd/api/services/containers/v1"
 	"github.com/containerd/containerd/containers"
@@ -30,6 +29,7 @@ import (
 	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/services"
 	ptypes "github.com/gogo/protobuf/types"
+	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	grpcm "google.golang.org/grpc/metadata"
@@ -147,9 +147,7 @@ func (l *local) Update(ctx context.Context, req *api.UpdateContainerRequest, _ .
 	if err := l.withStoreUpdate(ctx, func(ctx context.Context, store containers.Store) error {
 		var fieldpaths []string
 		if req.UpdateMask != nil && len(req.UpdateMask.Paths) > 0 {
-			for _, path := range req.UpdateMask.Paths {
-				fieldpaths = append(fieldpaths, path)
-			}
+			fieldpaths = append(fieldpaths, req.UpdateMask.Paths...)
 		}
 
 		updated, err := store.Update(ctx, container, fieldpaths...)
